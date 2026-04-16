@@ -1,0 +1,645 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TextureForge 3.4 - Pro Workflow (Fixed)</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <style>
+        body { background-color: #0f172a; color: #e2e8f0; overflow: hidden; user-select: none; }
+        .canvas-pattern {
+            background-image: radial-gradient(#334155 1px, transparent 1px);
+            background-size: 20px 20px;
+        }
+        input[type=range] { accent-color: #3b82f6; }
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: #020617; }
+        ::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+        .spinner {
+            border: 3px solid rgba(255,255,255,0.3);
+            border-radius: 50%;
+            border-top: 3px solid #3b82f6;
+            width: 16px; height: 16px;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef, useCallback } = React;
+        
+        // --- UTILS ---
+        const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
+        const getCtx = (w, h) => {
+            const canvas = document.createElement('canvas');
+            canvas.width = w; canvas.height = h;
+            return { c: canvas, ctx: canvas.getContext('2d', { willReadFrequently: true }) };
+        };
+        const hexToRgb = (hex) => {
+            const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+            return result ? { r: parseInt(result[1], 16), g: parseInt(result[2], 16), b: parseInt(result[3], 16) } : null;
+        }
+
+        const Icon = ({ name, size = 16, className }) => {
+            const ref = useRef(null);
+            useEffect(() => {
+                if (!window.lucide || !window.lucide.icons) return;
+                const pascalName = name.replace(/(^\w|-\w)/g, (m) => m.replace('-','').toUpperCase());
+                const iconDef = window.lucide.icons[pascalName];
+                if (iconDef && ref.current) {
+                    ref.current.innerHTML = ''; 
+                    if (window.lucide.createElement) {
+                        const svg = window.lucide.createElement(iconDef);
+                        svg.setAttribute('width', size); svg.setAttribute('height', size);
+                        if (className) svg.setAttribute('class', className);
+                        svg.setAttribute('stroke-width', 2);
+                        ref.current.appendChild(svg);
+                    }
+                }
+            }, [name, size, className]);
+            return <span ref={ref} style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }} />;
+        };
+
+        // --- ALGORITHMS ---
+        const makeSeamlessPatch = (imgData, strength, w, h) => {
+            if (strength <= 0) { const {ctx} = getCtx(w,h); ctx.putImageData(imgData,0,0); return ctx.getImageData(0,0,w,h); }
+            const { c, ctx } = getCtx(w, h); const { c: srcC, ctx: srcCtx } = getCtx(w, h);
+            srcCtx.putImageData(imgData, 0, 0);
+            ctx.drawImage(srcC, -w/2, -h/2); ctx.drawImage(srcC, w/2, -h/2); ctx.drawImage(srcC, -w/2, h/2); ctx.drawImage(srcC, w/2, h/2);
+            const numPatches = Math.floor((strength / 100) * 40) + 5; 
+            const patchSize = Math.floor(w * 0.15); 
+            const splat = (tx, ty) => {
+                const sx = Math.random() * (w - patchSize); const sy = Math.random() * (h - patchSize);
+                const {c: pC, ctx: pCtx} = getCtx(patchSize, patchSize);
+                pCtx.drawImage(srcC, sx, sy, patchSize, patchSize, 0, 0, patchSize, patchSize);
+                pCtx.globalCompositeOperation = 'destination-in';
+                const grad = pCtx.createRadialGradient(patchSize/2, patchSize/2, 0, patchSize/2, patchSize/2, patchSize/2);
+                grad.addColorStop(0, 'rgba(0,0,0,1)'); grad.addColorStop(1, 'rgba(0,0,0,0)');
+                pCtx.fillStyle = grad; pCtx.fillRect(0,0,patchSize,patchSize);
+                ctx.drawImage(pC, tx - patchSize/2, ty - patchSize/2);
+            };
+            for(let i=0; i<numPatches; i++) { splat(w/2 + (Math.random()-0.5)*patchSize, Math.random()*h); splat(Math.random()*w, h/2 + (Math.random()-0.5)*patchSize); }
+            return ctx.getImageData(0, 0, w, h);
+        };
+
+        const createNormalMap = (imgData, intensity, mode) => {
+            const w = imgData.width; const h = imgData.height; const src = imgData.data; const output = new Uint8ClampedArray(w * h * 4);
+            const idx = (x, y) => ((y + h) % h * w + (x + w) % w) * 4;
+            const getVal = (x, y) => (src[idx(x,y)] + src[idx(x,y)+1] + src[idx(x,y)+2]) / 3;
+            for (let y = 0; y < h; y++) {
+                for (let x = 0; x < w; x++) {
+                    const tl = getVal(x-1, y-1); const t = getVal(x, y-1); const tr = getVal(x+1, y-1);
+                    const l  = getVal(x-1, y);                             const r  = getVal(x+1, y);
+                    const bl = getVal(x-1, y+1); const b = getVal(x, y+1); const br = getVal(x+1, y+1);
+                    let dX = (tr + 2*r + br) - (tl + 2*l + bl); let dY = (bl + 2*b + br) - (tl + 2*t + tr);
+                    if (mode === 'soft') { dX *= 0.5; dY *= 0.5; } else if (mode === 'detail') { if (Math.abs(dX) < 20) dX *= 2; if (Math.abs(dY) < 20) dY *= 2; }
+                    const dZ = 255 / (intensity * 2); const len = Math.sqrt(dX*dX + dY*dY + dZ*dZ);
+                    const i = (y * w + x) * 4;
+                    output[i] = ((dX/len)*0.5+0.5) * 255; output[i+1] = ((dY/len)*0.5+0.5) * 255; output[i+2] = ((dZ/len)*0.5+0.5) * 255; output[i+3] = 255;
+                }
+            }
+            return new ImageData(output, w, h);
+        };
+
+        const createAO = (imgData, strength, radius) => {
+            const w = imgData.width; const h = imgData.height; const { c, ctx } = getCtx(w, h);
+            ctx.putImageData(imgData, 0, 0); ctx.globalCompositeOperation = 'saturation'; ctx.fillStyle = 'black'; ctx.fillRect(0,0,w,h);
+            const grayData = ctx.getImageData(0,0,w,h);
+            const { c: bC, ctx: bCtx } = getCtx(w, h); bCtx.putImageData(grayData, 0, 0); bCtx.filter = `blur(${radius}px)`; bCtx.drawImage(bC, 0, 0);
+            const blurData = bCtx.getImageData(0,0,w,h);
+            const out = new Uint8ClampedArray(w*h*4);
+            for(let i=0; i<out.length; i+=4) {
+                let diff = (grayData.data[i] - blurData.data[i]); 
+                let val = 255; if (diff < 0) val = 255 + (diff * strength * 5); 
+                out[i] = val; out[i+1] = val; out[i+2] = val; out[i+3] = 255;
+            }
+            return new ImageData(out, w, h);
+        };
+
+        const createOpacityMap = (imgData, keyHex, tolerance) => {
+            const w = imgData.width; const h = imgData.height;
+            const out = new Uint8ClampedArray(w*h*4);
+            const key = hexToRgb(keyHex);
+            const tol = tolerance * 2.55; 
+            for(let i=0; i<imgData.data.length; i+=4) {
+                const r = imgData.data[i]; const g = imgData.data[i+1]; const b = imgData.data[i+2];
+                // Simple distance
+                const dist = Math.sqrt(Math.pow(r-key.r,2) + Math.pow(g-key.g,2) + Math.pow(b-key.b,2));
+                let alpha = 255;
+                if (dist < tol) alpha = 0;
+                else if (dist < tol + 20) alpha = (dist - tol) / 20 * 255; // Soft edge
+                
+                out[i] = alpha; out[i+1] = alpha; out[i+2] = alpha; out[i+3] = 255;
+            }
+            return new ImageData(out, w, h);
+        }
+
+        const createHeightMap = (imgData, contrast, brightness, invert) => {
+            const w = imgData.width; const h = imgData.height;
+            const out = new Uint8ClampedArray(w * h * 4);
+            for(let i=0; i<imgData.data.length; i+=4) {
+                let lum = (imgData.data[i]*0.3 + imgData.data[i+1]*0.59 + imgData.data[i+2]*0.11);
+                // Apply contrast/brightness
+                lum = (lum - 128) * (1 + contrast/50) + 128 + (brightness*2);
+                if (invert) lum = 255 - lum;
+                lum = clamp(lum, 0, 255);
+                out[i] = lum; out[i+1] = lum; out[i+2] = lum; out[i+3] = 255;
+            }
+            return new ImageData(out, w, h);
+        };
+
+        const createMetalMap = (imgData, threshold, smoothness) => {
+            const w = imgData.width; const h = imgData.height;
+            const out = new Uint8ClampedArray(w * h * 4);
+            const threshVal = (threshold / 100) * 255;
+            for(let i=0; i<imgData.data.length; i+=4) {
+                let lum = (imgData.data[i] + imgData.data[i+1] + imgData.data[i+2]) / 3;
+                let val = 0; if (lum > threshVal) { val = 255; if (smoothness > 0) { let diff = lum - threshVal; if (diff < smoothness * 2) val = (diff / (smoothness * 2)) * 255; } }
+                out[i] = val; out[i+1] = val; out[i+2] = val; out[i+3] = 255;
+            }
+            return new ImageData(out, w, h);
+        };
+
+        const createEnvTexture = (type) => {
+            const canvas = document.createElement('canvas'); canvas.width=512; canvas.height=256; const ctx=canvas.getContext('2d');
+            if (type === 'studio') { ctx.fillStyle='#111'; ctx.fillRect(0,0,512,256); ctx.fillStyle='#fff'; ctx.filter='blur(20px)'; ctx.fillRect(100,50,50,150); ctx.fillRect(350,80,80,80); ctx.fillStyle='#4455bb'; ctx.fillRect(0,0,512,40); }
+            else if (type === 'sunset') { const g=ctx.createLinearGradient(0,0,0,256); g.addColorStop(0,'#2a0a4a'); g.addColorStop(0.5,'#d94f00'); g.addColorStop(1,'#1a0500'); ctx.fillStyle=g; ctx.fillRect(0,0,512,256); ctx.fillStyle='#ffcc00'; ctx.beginPath(); ctx.arc(256, 128, 40, 0, Math.PI*2); ctx.fill(); }
+            else { ctx.fillStyle='#778899'; ctx.fillRect(0,0,512,128); ctx.fillStyle='#556677'; ctx.fillRect(0,128,512,128); ctx.fillStyle='#aabbcc'; ctx.filter='blur(40px)'; ctx.fillRect(0,0,512,256); }
+            return canvas;
+        };
+
+        const App = () => {
+            const [activeTab, setActiveTab] = useState('base');
+            const [viewMap, setViewMap] = useState('base'); 
+            const [origImage, setOrigImage] = useState(null); 
+            const [rawSource, setRawSource] = useState(null); 
+            const [seamlessImage, setSeamlessImage] = useState(null); 
+            const [history, setHistory] = useState([]);
+            const [historyIndex, setHistoryIndex] = useState(-1);
+            const [envMode, setEnvMode] = useState('studio');
+            const [meshType, setMeshType] = useState('plane');
+            const [resolution, setResolution] = useState(512);
+            
+            // Params
+            const [useSmartTiling, setUseSmartTiling] = useState(false);
+            const [seamlessStr, setSeamlessStr] = useState(0);
+            
+            // Clone Tool
+            const [cloneMode, setCloneMode] = useState(false); 
+            const [cloneSource, setCloneSource] = useState(null); 
+            
+            // Opacity
+            const [opKeyColor, setOpKeyColor] = useState("#000000");
+            const [opTol, setOpTol] = useState(10);
+
+            // Maps
+            const [normInt, setNormInt] = useState(3); const [normMode, setNormMode] = useState('crisp');
+            const [aoStr, setAoStr] = useState(1.0); const [aoRad, setAoRad] = useState(4);
+            const [roughCon, setRoughCon] = useState(20);
+            const [heightCon, setHeightCon] = useState(0); const [heightBri, setHeightBri] = useState(0); const [invertHeight, setInvertHeight] = useState(false);
+            const [metalThresh, setMetalThresh] = useState(80);
+            
+            // Paint & View
+            const [brushSize, setBrushSize] = useState(50);
+            const [brushStr, setBrushStr] = useState(50);
+            const [paintMode, setPaintMode] = useState('raise');
+            const [isPainting, setIsPainting] = useState(false);
+            const [cursorPos, setCursorPos] = useState({x:-100, y:-100});
+            const [dragStartPos, setDragStartPos] = useState(null); 
+            const [cloneOffset, setCloneOffset] = useState(null); 
+            const [zoom2D, setZoom2D] = useState(1);
+            const [showTiling, setShowTiling] = useState(false); 
+
+            // AI
+            const [aiPrompt, setAiPrompt] = useState("");
+            const [userApiKey, setUserApiKey] = useState("");
+            const [isAiLoading, setIsAiLoading] = useState(false);
+            const [aiStatus, setAiStatus] = useState("");
+            const [aiLog, setAiLog] = useState("");
+
+            const canvBase = useRef(null); const canvNorm = useRef(null); const canvAO = useRef(null);
+            const canvRough = useRef(null); const canvHeight = useRef(null); const canvMetal = useRef(null);
+            const canvOpacity = useRef(null);
+            
+            const main2DRef = useRef(null); 
+            const ghosts = [useRef(null), useRef(null), useRef(null), useRef(null), useRef(null), useRef(null), useRef(null), useRef(null)];
+            const threeMount = useRef(null); const sceneObjs = useRef({});
+
+            // --- 3D SETUP ---
+            useEffect(() => {
+                if (!threeMount.current) return;
+                const w = threeMount.current.clientWidth; const h = threeMount.current.clientHeight;
+                const scene = new THREE.Scene();
+                const camera = new THREE.PerspectiveCamera(45, w/h, 0.1, 100); camera.position.set(0, 0, 2.5);
+                const renderer = new THREE.WebGLRenderer({ antialias: true });
+                renderer.setSize(w, h); renderer.toneMapping = THREE.ACESFilmicToneMapping; renderer.outputEncoding = THREE.sRGBEncoding;
+                threeMount.current.appendChild(renderer.domElement);
+                const dirLight = new THREE.DirectionalLight(0xffffff, 1.0); dirLight.position.set(2, 2, 5); scene.add(dirLight);
+                const pointLight = new THREE.PointLight(0xffaa00, 1, 10); scene.add(pointLight);
+                const mat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 1.0, metalness: 1.0, aoMapIntensity: 1.0, displacementScale: 0.1, side: THREE.DoubleSide, transparent: true, alphaTest: 0.5 });
+                const mesh = new THREE.Mesh(new THREE.BufferGeometry(), mat); scene.add(mesh);
+                sceneObjs.current = { scene, camera, renderer, mesh, pointLight };
+                
+                const handleResize = () => { if(threeMount.current){ const nw=threeMount.current.clientWidth; const nh=threeMount.current.clientHeight; renderer.setSize(nw, nh); camera.aspect=nw/nh; camera.updateProjectionMatrix();}};
+                window.addEventListener('resize', handleResize);
+                let reqId;
+                const animate = () => { reqId = requestAnimationFrame(animate); renderer.render(scene, camera); };
+                animate();
+
+                let isDragging = false; let prevX = 0; let prevY = 0;
+                const onDown = (e) => { isDragging = true; prevX = e.clientX; prevY = e.clientY; };
+                const onUp = () => { isDragging = false; };
+                const onMove = (e) => { if(!isDragging)return; const dx=e.clientX-prevX; const dy=e.clientY-prevY; mesh.rotation.y+=dx*0.01; mesh.rotation.x+=dy*0.01; prevX=e.clientX; prevY=e.clientY; };
+                const onWheel = (e) => { camera.position.z = clamp(camera.position.z + e.deltaY*0.003, 0.5, 8.0); };
+
+                threeMount.current.addEventListener('mousedown', onDown); threeMount.current.addEventListener('wheel', onWheel, {passive:true});
+                window.addEventListener('mouseup', onUp); window.addEventListener('mousemove', onMove);
+
+                return () => {
+                    window.removeEventListener('resize', handleResize); window.removeEventListener('mouseup', onUp); window.removeEventListener('mousemove', onMove);
+                    if(threeMount.current) { threeMount.current.removeEventListener('mousedown', onDown); threeMount.current.removeEventListener('wheel', onWheel); if(renderer.domElement) threeMount.current.removeChild(renderer.domElement); }
+                    cancelAnimationFrame(reqId); renderer.dispose();
+                };
+            }, []);
+
+            // --- 2D ZOOM ---
+            const handleWheel2D = (e) => setZoom2D(prev => clamp(prev - e.deltaY * 0.001, 0.1, 5));
+
+            // --- GEOMETRY & ENV ---
+            useEffect(() => {
+                if(!sceneObjs.current.mesh) return;
+                const mesh = sceneObjs.current.mesh; if(mesh.geometry) mesh.geometry.dispose();
+                let geom;
+                if (meshType === 'plane') geom = new THREE.PlaneGeometry(1.5, 1.5, 256, 256);
+                else if (meshType === 'cube') geom = new THREE.BoxGeometry(1, 1, 1, 64, 64, 64);
+                else if (meshType === 'sphere') geom = new THREE.SphereGeometry(0.7, 128, 128);
+                geom.setAttribute('uv2', geom.attributes.uv); mesh.geometry = geom; mesh.rotation.set(0,0,0);
+            }, [meshType]);
+
+            useEffect(() => {
+                if(!sceneObjs.current.scene) return;
+                const canvas = createEnvTexture(envMode); const t = new THREE.CanvasTexture(canvas); t.mapping = THREE.EquirectangularReflectionMapping;
+                sceneObjs.current.scene.environment = t; sceneObjs.current.scene.background = new THREE.Color(envMode==='studio'?0x111111:(envMode==='sunset'?0x1a0500:0x556677));
+            }, [envMode]);
+
+            // --- RESOLUTION & INIT ---
+            useEffect(() => {
+                const { ctx } = getCtx(resolution, resolution);
+                if (rawSource) { ctx.drawImage(rawSource, 0, 0, resolution, resolution); } 
+                else {
+                    ctx.fillStyle = '#64748b'; ctx.fillRect(0,0,resolution,resolution); ctx.fillStyle = '#94a3b8';
+                    const bw=resolution/4; const bh=resolution/8;
+                    for(let y=0; y<resolution; y+=bh) for(let x=0; x<resolution; x+=bw) ctx.fillRect(x+((y/bh)%2===0?0:bw/2)+4, y+4, bw-8, bh-8);
+                }
+                setOrigImage(ctx.getImageData(0,0,resolution,resolution));
+            }, [resolution, rawSource]);
+
+            // --- PIPELINE ---
+            const updateCanvas = (ref, data) => { if(ref.current) { ref.current.width=data.width; ref.current.height=data.height; ref.current.getContext('2d').putImageData(data, 0, 0); } };
+            const loadTex = (cv) => { const t = new THREE.CanvasTexture(cv); t.wrapS=1000; t.wrapT=1000; return t; }
+            
+            const update3D = () => {
+                if (!sceneObjs.current.mesh) return;
+                const mat = sceneObjs.current.mesh.material;
+                if(canvBase.current?.width) mat.map = loadTex(canvBase.current);
+                if(canvNorm.current?.width) mat.normalMap = loadTex(canvNorm.current);
+                if(canvAO.current?.width) { mat.aoMap = loadTex(canvAO.current); mat.aoMapIntensity = aoStr; }
+                if(canvRough.current?.width) mat.roughnessMap = loadTex(canvRough.current);
+                if(canvHeight.current?.width) mat.displacementMap = loadTex(canvHeight.current);
+                if(canvMetal.current?.width) mat.metalnessMap = loadTex(canvMetal.current);
+                if(canvOpacity.current?.width) mat.alphaMap = loadTex(canvOpacity.current);
+                mat.needsUpdate = true;
+            };
+
+            const update2DView = () => {
+                if(!main2DRef.current) return;
+                const ctx = main2DRef.current.getContext('2d');
+                let source = canvBase.current;
+                if (viewMap === 'normal') source = canvNorm.current;
+                if (viewMap === 'ao') source = canvAO.current;
+                if (viewMap === 'rough') source = canvRough.current;
+                if (viewMap === 'height') source = canvHeight.current;
+                if (viewMap === 'metal') source = canvMetal.current;
+                if (viewMap === 'opacity') source = canvOpacity.current;
+
+                if (source && source.width > 0) {
+                    main2DRef.current.width = source.width; main2DRef.current.height = source.height;
+                    ctx.drawImage(source, 0, 0);
+                    if (showTiling) {
+                        ghosts.forEach(g => {
+                            if(g.current) { g.current.width=source.width; g.current.height=source.height; g.current.getContext('2d').drawImage(source,0,0); }
+                        });
+                    }
+                }
+            };
+
+            useEffect(() => {
+                if (!origImage) return;
+                const seamless = useSmartTiling ? makeSeamlessPatch(origImage, seamlessStr, origImage.width, origImage.height) : makeSeamlessPatch(origImage, 0, origImage.width, origImage.height);
+                updateCanvas(canvBase, seamless); setSeamlessImage(seamless); update2DView(); update3D();
+            }, [origImage, seamlessStr, useSmartTiling]);
+
+            useEffect(() => { if(!seamlessImage) return; const norm = createNormalMap(seamlessImage, normInt, normMode); updateCanvas(canvNorm, norm); setHistory([norm]); setHistoryIndex(0); update2DView(); update3D(); }, [seamlessImage, normInt, normMode]);
+            useEffect(() => { if(!seamlessImage) return; const ao = createAO(seamlessImage, aoStr, aoRad); updateCanvas(canvAO, ao); update2DView(); update3D(); }, [seamlessImage, aoStr, aoRad]);
+            useEffect(() => { if(!seamlessImage) return; const { ctx } = getCtx(seamlessImage.width, seamlessImage.height); ctx.putImageData(seamlessImage, 0, 0); const rData = ctx.getImageData(0,0,seamlessImage.width, seamlessImage.height); for(let i=0; i<rData.data.length; i+=4) { let lum = (rData.data[i]+rData.data[i+1]+rData.data[i+2])/3; lum = 255-lum; lum = (lum-128)*(1+roughCon/100)+128; lum = clamp(lum,0,255); rData.data[i]=lum; rData.data[i+1]=lum; rData.data[i+2]=lum; } updateCanvas(canvRough, rData); update2DView(); update3D(); }, [seamlessImage, roughCon]);
+            useEffect(() => { if(!seamlessImage) return; const hMap = createHeightMap(seamlessImage, heightCon, heightBri, invertHeight); updateCanvas(canvHeight, hMap); update2DView(); update3D(); }, [seamlessImage, heightCon, heightBri, invertHeight]);
+            useEffect(() => { if(!seamlessImage) return; const mMap = createMetalMap(seamlessImage, metalThresh, 20); updateCanvas(canvMetal, mMap); update2DView(); update3D(); }, [seamlessImage, metalThresh]);
+            useEffect(() => { if(!seamlessImage) return; const oMap = createOpacityMap(seamlessImage, opKeyColor, opTol); updateCanvas(canvOpacity, oMap); update2DView(); update3D(); }, [seamlessImage, opKeyColor, opTol]);
+
+            useEffect(() => { update2DView(); }, [viewMap, showTiling]);
+
+            // --- PAINT LOGIC ---
+            const applyPaint = (x, y) => {
+                if (viewMap === 'normal') {
+                    let targetCanv = canvNorm.current;
+                    const ctx = targetCanv.getContext('2d'); const w = targetCanv.width; const h = targetCanv.height; const r = brushSize;
+                    const sx = Math.floor(x-r); const sy = Math.floor(y-r); const dia = Math.ceil(r*2);
+                    if (sx+dia<0 || sx>=w || sy+dia<0 || sy>=h) return;
+                    const imgData = ctx.getImageData(sx, sy, dia, dia); const d = imgData.data;
+                    for (let py=0; py<dia; py++) for (let px=0; px<dia; px++) {
+                        const dist = Math.sqrt(Math.pow(px-r, 2) + Math.pow(py-r, 2)); if (dist > r) continue;
+                        const idx = (py*dia+px)*4;
+                        let nx = (d[idx]/255)*2-1; let ny = (d[idx+1]/255)*2-1; let nz = (d[idx+2]/255)*2-1;
+                        const bx = (px-r)/r; const by = (py-r)/r;
+                        const alpha = Math.max(0, 1-(dist/r)) * (brushStr/100);
+                        
+                        // FINAL INVERSION (Raise subtracts, Lower adds)
+                        if (paintMode === 'raise') { nx -= bx*alpha; ny -= by*alpha; } 
+                        else if (paintMode === 'lower') { nx += bx*alpha; ny += by*alpha; } 
+                        else if (paintMode === 'smooth') { nx += (0-nx)*alpha; ny += (0-ny)*alpha; nz += (1-nz)*alpha; }
+                        
+                        const len = Math.sqrt(nx*nx + ny*ny + nz*nz);
+                        d[idx] = (nx/len*0.5+0.5)*255; d[idx+1] = (ny/len*0.5+0.5)*255; d[idx+2] = (nz/len*0.5+0.5)*255;
+                    }
+                    ctx.putImageData(imgData, sx, sy);
+                    sceneObjs.current.mesh.material.normalMap.image = targetCanv;
+                    sceneObjs.current.mesh.material.normalMap.needsUpdate = true;
+                } 
+                else if (viewMap === 'base' && cloneSource && cloneOffset) {
+                    let targetCanv = canvBase.current;
+                    const ctx = targetCanv.getContext('2d');
+                    const srcX = x - cloneOffset.x; const srcY = y - cloneOffset.y;
+                    const {c: brushC, ctx: bCtx} = getCtx(brushSize*2, brushSize*2);
+                    bCtx.drawImage(targetCanv, srcX - brushSize, srcY - brushSize, brushSize*2, brushSize*2, 0, 0, brushSize*2, brushSize*2);
+                    bCtx.globalCompositeOperation = 'destination-in';
+                    const g = bCtx.createRadialGradient(brushSize, brushSize, 0, brushSize, brushSize, brushSize);
+                    g.addColorStop(0, `rgba(0,0,0,${brushStr/100})`); g.addColorStop(1, 'rgba(0,0,0,0)');
+                    bCtx.fillStyle = g; bCtx.fillRect(0,0,brushSize*2,brushSize*2);
+                    ctx.drawImage(brushC, x - brushSize, y - brushSize);
+                    sceneObjs.current.mesh.material.map.image = targetCanv;
+                    sceneObjs.current.mesh.material.map.needsUpdate = true;
+                }
+                else if (viewMap === 'opacity') {
+                    const ctx = canvOpacity.current.getContext('2d');
+                    const g = ctx.createRadialGradient(x, y, 0, x, y, brushSize);
+                    const col = paintMode === 'raise' ? '255,255,255' : '0,0,0'; 
+                    g.addColorStop(0, `rgba(${col},1)`); g.addColorStop(1, `rgba(${col},0)`);
+                    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(x, y, brushSize, 0, Math.PI*2); ctx.fill();
+                    sceneObjs.current.mesh.material.alphaMap.image = canvOpacity.current;
+                    sceneObjs.current.mesh.material.alphaMap.needsUpdate = true;
+                }
+                update2DView();
+            };
+
+            const handlePaintMove = (e) => {
+                if (!main2DRef.current) return;
+                const rect = main2DRef.current.getBoundingClientRect();
+                const scaleX = (main2DRef.current.width / rect.width);
+                const scaleY = (main2DRef.current.height / rect.height);
+                const x = (e.clientX - rect.left) * scaleX;
+                const y = (e.clientY - rect.top) * scaleY;
+                setCursorPos({x, y});
+                if (isPainting) applyPaint(x, y);
+            };
+            
+            const handlePaintStart = (e) => { 
+                const rect = main2DRef.current.getBoundingClientRect();
+                const x = ((e.clientX - rect.left) / rect.width) * resolution;
+                const y = ((e.clientY - rect.top) / rect.height) * resolution;
+                if (cloneMode) { setCloneSource({x,y}); setCloneMode(false); return; }
+                if (viewMap === 'base' && cloneSource) setCloneOffset({x: x - cloneSource.x, y: y - cloneSource.y});
+                setIsPainting(true); handlePaintMove(e); 
+            };
+            
+            const handlePaintEnd = () => { 
+                if (isPainting) { 
+                    setIsPainting(false); 
+                    const snap = canvNorm.current.getContext('2d').getImageData(0,0,canvNorm.current.width, canvNorm.current.height);
+                    const newHist = history.slice(0, historyIndex + 1);
+                    newHist.push(snap);
+                    if (newHist.length > 10) newHist.shift();
+                    setHistory(newHist);
+                    setHistoryIndex(newHist.length - 1);
+                } 
+            };
+            const undo = () => { 
+                if (historyIndex > 0) { 
+                    const prev = history[historyIndex - 1]; 
+                    setHistoryIndex(historyIndex - 1); 
+                    canvNorm.current.getContext('2d').putImageData(prev, 0, 0); 
+                    
+                    // Explicitly update texture
+                    sceneObjs.current.mesh.material.normalMap = new THREE.CanvasTexture(canvNorm.current);
+                    sceneObjs.current.mesh.material.normalMap.wrapS = 1000;
+                    sceneObjs.current.mesh.material.normalMap.wrapT = 1000;
+                    sceneObjs.current.mesh.material.normalMap.needsUpdate = true;
+                    sceneObjs.current.mesh.material.needsUpdate = true;
+
+                    update2DView(); 
+                } 
+            };
+
+            const handleExportAll = async () => { if (!window.JSZip) return; const zip = new window.JSZip(); const addFile = (ref, name) => { if (ref.current) zip.file(`${name}.png`, ref.current.toDataURL('image/png').split(',')[1], {base64: true}); }; addFile(canvBase, 'albedo'); addFile(canvNorm, 'normal'); addFile(canvRough, 'roughness'); addFile(canvAO, 'ambient_occlusion'); addFile(canvHeight, 'height'); addFile(canvMetal, 'metallic'); addFile(canvOpacity, 'opacity'); const content = await zip.generateAsync({type:"blob"}); const link = document.createElement('a'); link.href = URL.createObjectURL(content); link.download = "TextureForge_Pack.zip"; link.click(); };
+            const handleUpload = (e) => { if (e.target.files?.[0]) { const img = new Image(); img.onload = () => { setRawSource(img); }; img.src = URL.createObjectURL(e.target.files[0]); } };
+            
+            // AUTO SELECT TAB ON VIEW CHANGE
+            const setViewAndTab = (id) => {
+                setViewMap(id);
+                // Map view ID to Tab ID (mostly 1:1)
+                setActiveTab(id);
+            };
+
+            // --- FIXED IMAGE GENERATION (POLLINATIONS.AI - NO KEY REQ) ---
+            const handleGenerateTexture = async () => { 
+                if (!aiPrompt) return; 
+                setIsAiLoading(true); 
+                try { 
+                    const finalPrompt = encodeURIComponent(aiPrompt + ", seamless texture, top down flat view, high quality 4k material, full frame, pbr texture");
+                    // Pollinations.ai is free and keyless
+                    const url = `https://image.pollinations.ai/prompt/${finalPrompt}?width=${resolution}&height=${resolution}&nologo=true&seed=${Math.floor(Math.random()*10000)}`;
+                    
+                    const response = await fetch(url);
+                    const blob = await response.blob();
+                    const img = new Image();
+                    img.onload = () => { 
+                        setRawSource(img); 
+                        setIsAiLoading(false); 
+                    };
+                    img.src = URL.createObjectURL(blob);
+                } catch (e) { 
+                    console.error(e);
+                    setIsAiLoading(false); 
+                    setAiStatus("Error generating image");
+                } 
+            };
+
+            // --- FIXED SMART SETTINGS (GEMINI 1.5 FLASH - FREE TIER) ---
+            const handleSmartSettings = async () => { 
+                if(!aiPrompt || !userApiKey) { setAiStatus("API Key needed for Settings"); return; }
+                setIsAiLoading(true); 
+                setAiStatus("Analyzing..."); 
+                try { 
+                    const sysPrompt = `Return JSON: {"seamlessStr":int(0-100), "normInt":int(1-10), "roughCon":int(-50-100), "aoStr":float(0-5), "metalThresh":int(0-255)}. Params for: ${aiPrompt}`; 
+                    // Switched to gemini-1.5-flash (Standard Free Model)
+                    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${userApiKey}`, { 
+                        method: 'POST', 
+                        headers: { 'Content-Type': 'application/json' }, 
+                        body: JSON.stringify({ contents: [{ parts: [{ text: sysPrompt }] }] }) 
+                    }); 
+                    const res = await response.json(); 
+                    if(res.error) throw new Error(res.error.message);
+                    
+                    const text = res.candidates?.[0]?.content?.parts?.[0]?.text || "{}";
+                    const jsonStr = text.replace(/```json|```/g, '').trim();
+                    const json = JSON.parse(jsonStr); 
+                    
+                    if(json.seamlessStr!==undefined) setSeamlessStr(json.seamlessStr); 
+                    if(json.normInt!==undefined) setNormInt(json.normInt); 
+                    if(json.roughCon!==undefined) setRoughCon(json.roughCon); 
+                    if(json.metalThresh!==undefined) setMetalThresh(json.metalThresh); 
+                    setAiStatus("Applied!"); 
+                    setTimeout(()=>setAiStatus(""),2000); 
+                } catch (e) { 
+                    console.error(e);
+                    setAiStatus("API Error"); 
+                } finally { 
+                    setIsAiLoading(false); 
+                } 
+            };
+
+            return (
+                <div className="flex h-screen bg-slate-950 text-slate-200 font-sans select-none" onMouseUp={handlePaintEnd}>
+                    <div className="w-80 flex-shrink-0 flex flex-col border-r border-slate-800 bg-slate-900 z-20">
+                        <div className="p-4 bg-slate-950 border-b border-slate-800"><h1 className="text-xl font-bold flex items-center gap-2 text-blue-400"><Icon name="hammer" size={20} /> TextureForge 3.4</h1></div>
+                        <div className="flex-1 overflow-y-auto custom-scrollbar">
+                            <div className="p-4 bg-blue-900/10 border-b border-slate-800">
+                                <h2 className="text-xs font-bold text-blue-300 uppercase mb-2 flex items-center gap-2"><Icon name="sparkles" size={12} className="text-yellow-400"/> AI Workshop</h2>
+                                <input type="password" className="w-full bg-slate-800 border border-slate-700 rounded p-2 text-xs mb-2 focus:outline-none" placeholder="Gemini API Key (For Settings Only)" value={userApiKey} onChange={e=>setUserApiKey(e.target.value)}/>
+                                <textarea className="w-full bg-slate-800 border border-slate-700 rounded p-2 text-xs mb-2 resize-none focus:outline-none" rows="2" placeholder="Describe texture (e.g. Rusty Metal Panel)..." value={aiPrompt} onChange={e=>setAiPrompt(e.target.value)}/>
+                                <div className="grid grid-cols-2 gap-2">
+                                    <button onClick={handleGenerateTexture} disabled={isAiLoading||!aiPrompt} className="bg-blue-600 text-white text-[10px] font-bold py-2 rounded flex justify-center items-center gap-1">
+                                        {isAiLoading?<div className="spinner"/>:<><Icon name="image" size={12}/> GENERATE (FREE)</>}
+                                    </button>
+                                    <button onClick={handleSmartSettings} disabled={isAiLoading||!aiPrompt||!userApiKey} className="bg-slate-700 text-white text-[10px] font-bold py-2 rounded flex justify-center items-center gap-1">
+                                        <Icon name="sliders" size={12}/> SETTINGS (KEY)
+                                    </button>
+                                </div>
+                                {aiStatus && <div className="text-[10px] text-blue-300 mt-2 text-center">{aiStatus}</div>}
+                                {aiLog && <div className="text-[9px] text-slate-400 mt-2 bg-black/30 p-2 rounded border border-white/10 font-mono">{aiLog}</div>}
+                            </div>
+                            <div className="p-4 space-y-6">
+                                <div className="flex flex-col gap-2">
+                                    <div className="flex gap-2"><label className="flex-1 btn bg-slate-800 border border-slate-700 text-slate-300 py-2 rounded flex justify-center items-center gap-2 cursor-pointer text-xs font-semibold"><Icon name="upload" size={12}/> Import<input type="file" className="hidden" onChange={handleUpload}/></label><button onClick={handleExportAll} className="flex-1 btn bg-slate-800 border border-slate-700 text-slate-300 py-2 rounded flex justify-center items-center gap-2 text-xs"><Icon name="download" size={12}/> Export</button></div>
+                                    <select className="w-full bg-slate-800 border border-slate-700 text-xs text-slate-300 rounded px-2 py-1" value={resolution} onChange={e=>setResolution(parseInt(e.target.value))}>{[64,128,256,512,1024,2048].map(r=><option key={r} value={r}>{r}x{r}</option>)}</select>
+                                </div>
+                                <div className="flex bg-slate-800 rounded p-1 overflow-x-auto custom-scrollbar">{['base','normal','rough','ao','height','metal','opacity'].map(t=><button key={t} onClick={()=>setViewAndTab(t)} className={`flex-1 py-1 px-2 text-[10px] font-bold uppercase rounded whitespace-nowrap ${activeTab===t?'bg-blue-600 text-white':'text-slate-400'}`}>{t}</button>)}</div>
+                                <div className="space-y-4">
+                                    {activeTab==='base' && <div className="bg-slate-800 p-3 rounded border border-slate-700">
+                                        <h3 className="text-xs font-bold text-slate-400 uppercase mb-2">Seamless</h3>
+                                        <div className="flex items-center gap-2 mb-3"><input type="checkbox" checked={useSmartTiling} onChange={e=>setUseSmartTiling(e.target.checked)} className="w-4 h-4"/><span className="text-xs">Smart Patching</span></div>
+                                        <input type="range" className="w-full mb-4" value={seamlessStr} onChange={e=>setSeamlessStr(Number(e.target.value))}/>
+                                        <div className="border-t border-slate-600 pt-3">
+                                            <h3 className="text-xs font-bold text-slate-400 uppercase mb-2">Manual Clone</h3>
+                                            <button onClick={()=>setCloneMode(true)} className={`w-full py-2 text-xs rounded mb-2 ${cloneMode?'bg-blue-600 text-white animate-pulse':'bg-slate-700 text-slate-300'}`}>{cloneMode?'CLICK TEXTURE TO SET SOURCE':'SET SOURCE POINT'}</button>
+                                            <div className="flex gap-2 text-[10px] text-slate-500">{cloneSource ? `Source: ${Math.round(cloneSource.x)},${Math.round(cloneSource.y)}` : 'No source set'}</div>
+                                            <label className="text-xs block mt-2">Brush Size</label><input type="range" min="5" max="300" className="w-full" value={brushSize} onChange={e=>setBrushSize(Number(e.target.value))}/>
+                                            <label className="text-xs block mt-2">Pressure</label><input type="range" className="w-full" value={brushStr} onChange={e=>setBrushStr(Number(e.target.value))}/>
+                                        </div>
+                                    </div>}
+                                    {activeTab==='normal' && <div className="space-y-4">
+                                        <div className="bg-slate-800 p-3 rounded border border-slate-700"><h3 className="text-xs font-bold text-slate-400 uppercase mb-2">Generation</h3><div className="flex gap-1 mb-2">{['soft','crisp','detail'].map(m=><button key={m} onClick={()=>setNormMode(m)} className={`flex-1 text-[10px] py-1 border border-slate-600 rounded uppercase ${normMode===m?'bg-blue-600 text-white':'bg-slate-700'}`}>{m}</button>)}</div><label className="text-xs block">Strength</label><input type="range" min="1" max="10" className="w-full" value={normInt} onChange={e=>setNormInt(Number(e.target.value))}/></div>
+                                        <div className="bg-slate-800 p-3 rounded border border-slate-700 border-l-4 border-l-blue-500"><div className="flex justify-between mb-2"><h3 className="text-xs font-bold text-white uppercase">Paint</h3><button onClick={undo} className="text-[10px] bg-slate-700 px-2 rounded hover:bg-slate-600">UNDO</button></div><div className="flex gap-1 mb-2">{['raise','lower','smooth'].map(m=><button key={m} onClick={()=>setPaintMode(m)} className={`flex-1 text-[10px] py-1 rounded uppercase ${paintMode===m?'bg-blue-600 text-white':'bg-slate-700'}`}>{m}</button>)}</div><label className="text-xs block">Size</label><input type="range" min="5" max="300" className="w-full" value={brushSize} onChange={e=>setBrushSize(Number(e.target.value))}/><label className="text-xs block mt-1">Pressure</label><input type="range" className="w-full" value={brushStr} onChange={e=>setBrushStr(Number(e.target.value))}/></div>
+                                    </div>}
+                                    {activeTab==='rough' && <div className="space-y-4">
+                                        <div className="bg-slate-800 p-3 rounded border border-slate-700"><h3 className="text-xs font-bold text-slate-400 uppercase mb-2">Roughness</h3><label className="text-xs block">Contrast</label><input type="range" min="-50" max="100" className="w-full" value={roughCon} onChange={e=>setRoughCon(Number(e.target.value))}/></div>
+                                    </div>}
+                                    {activeTab==='ao' && <div className="space-y-4">
+                                        <div className="bg-slate-800 p-3 rounded border border-slate-700"><h3 className="text-xs font-bold text-slate-400 uppercase mb-2">AO</h3><label className="text-xs block">Strength</label><input type="range" min="0" max="5" step="0.1" className="w-full" value={aoStr} onChange={e=>setAoStr(Number(e.target.value))}/><label className="text-xs block mt-1">Radius</label><input type="range" min="1" max="10" className="w-full" value={aoRad} onChange={e=>setAoRad(Number(e.target.value))}/></div>
+                                    </div>}
+                                    {activeTab==='height' && <div className="bg-slate-800 p-3 rounded border border-slate-700">
+                                        <h3 className="text-xs font-bold text-slate-400 uppercase mb-2">Height</h3>
+                                        <div className="flex items-center gap-2 mb-3"><input type="checkbox" checked={invertHeight} onChange={e=>setInvertHeight(e.target.checked)} className="w-4 h-4"/><span className="text-xs">Invert Map</span></div>
+                                        <label className="text-xs block">Contrast</label><input type="range" min="-50" max="50" className="w-full mb-2" value={heightCon} onChange={e=>setHeightCon(Number(e.target.value))}/>
+                                        <label className="text-xs block">Brightness</label><input type="range" min="-50" max="50" className="w-full" value={heightBri} onChange={e=>setHeightBri(Number(e.target.value))}/>
+                                    </div>}
+                                    {activeTab==='metal' && <div className="bg-slate-800 p-3 rounded border border-slate-700">
+                                        <h3 className="text-xs font-bold text-slate-400 uppercase mb-2">Metallic</h3>
+                                        <label className="text-xs block">Threshold</label><input type="range" min="0" max="255" className="w-full" value={metalThresh} onChange={e=>setMetalThresh(Number(e.target.value))}/>
+                                    </div>}
+                                    {activeTab==='opacity' && <div className="bg-slate-800 p-3 rounded border border-slate-700">
+                                        <h3 className="text-xs font-bold text-slate-400 uppercase mb-2">Opacity</h3>
+                                        <label className="text-xs block">Chroma Key</label><div className="flex gap-2 mb-2"><input type="color" value={opKeyColor} onChange={e=>setOpKeyColor(e.target.value)} className="h-6 w-8 p-0 bg-transparent border-none"/><span className="text-xs self-center">{opKeyColor}</span></div>
+                                        <label className="text-xs block">Tolerance</label><input type="range" min="0" max="100" className="w-full mb-4" value={opTol} onChange={e=>setOpTol(Number(e.target.value))}/>
+                                        <div className="border-t border-slate-600 pt-3"><h3 className="text-xs font-bold text-slate-400 uppercase mb-2">Mask Paint</h3><div className="flex gap-1 mb-2"><button onClick={()=>setPaintMode('raise')} className={`flex-1 py-1 text-xs rounded ${paintMode==='raise'?'bg-blue-600 text-white':'bg-slate-700'}`}>Opaque</button><button onClick={()=>setPaintMode('lower')} className={`flex-1 py-1 text-xs rounded ${paintMode==='lower'?'bg-blue-600 text-white':'bg-slate-700'}`}>Trans</button></div><label className="text-xs block">Size</label><input type="range" min="5" max="300" className="w-full" value={brushSize} onChange={e=>setBrushSize(Number(e.target.value))}/></div>
+                                    </div>}
+                                </div>
+                            </div>
+                        </div>
+                        <div className="p-2 grid grid-cols-7 gap-1 bg-slate-950 border-t border-slate-800 h-24 flex-shrink-0">
+                            {[{ref:canvBase,l:'ALB',id:'base'},{ref:canvNorm,l:'NRM',id:'normal'},{ref:canvRough,l:'RGH',id:'rough'},{ref:canvAO,l:'AO',id:'ao'},{ref:canvHeight,l:'HGT',id:'height'},{ref:canvMetal,l:'MTL',id:'metal'},{ref:canvOpacity,l:'OPC',id:'opacity'}].map(x=><div key={x.l} onClick={()=>setViewAndTab(x.id)} className={`flex flex-col cursor-pointer ${viewMap===x.id?'opacity-100 ring-1 ring-blue-500':'opacity-50 hover:opacity-100'}`}><span className="text-[8px] text-center">{x.l}</span><canvas ref={x.ref} className="w-full bg-black rounded border border-slate-800"/></div>)}
+                        </div>
+                    </div>
+                    <div className="flex-1 bg-gray-900 flex flex-col relative overflow-hidden" onWheel={handleWheel2D}>
+                         <div className="absolute top-2 left-2 z-10 flex gap-2">
+                             <span className="text-xs bg-black/50 px-2 py-1 rounded text-slate-400">VIEW: {viewMap.toUpperCase()} | ZOOM: {Math.round(zoom2D*100)}%</span>
+                             <button onClick={()=>setShowTiling(!showTiling)} className={`text-xs px-2 py-1 rounded border ${showTiling?'bg-blue-600 text-white border-blue-500':'bg-black/50 text-slate-400 border-slate-600'}`}>3x3 TILE</button>
+                         </div>
+                         <div className="flex-1 flex items-center justify-center bg-black canvas-pattern relative cursor-crosshair overflow-hidden" onMouseDown={handlePaintStart} onMouseMove={handlePaintMove}>
+                            <div style={{ transform: `scale(${zoom2D})`, transformOrigin: 'center', transition: 'transform 0.1s' }} className="relative shadow-2xl flex flex-wrap w-fit h-fit items-center justify-center">
+                                {showTiling && <style>{`.relative.shadow-2xl { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0; } canvas { width: 100%; height: 100%; display: block; }`}</style>}
+                                
+                                {showTiling && <><canvas ref={ghosts[0]} className="opacity-50"/><canvas ref={ghosts[1]} className="opacity-50"/><canvas ref={ghosts[2]} className="opacity-50"/></>}
+                                {showTiling && <canvas ref={ghosts[3]} className="opacity-50"/>}
+                                
+                                <div className="relative">
+                                    <canvas ref={main2DRef} className="border border-slate-700" style={{imageRendering:'pixelated'}}/>
+                                    {(viewMap==='normal'||viewMap==='base'||viewMap==='opacity')&&!cloneMode&&<div className="absolute border-2 border-green-400 shadow-[0_0_5px_rgba(0,0,0,1)] rounded-full pointer-events-none" style={{width:(brushSize/resolution)*100+'%',height:(brushSize/resolution)*100*main2DRef.current?.width/main2DRef.current?.height+'%',left:((cursorPos.x/resolution)*100)+'%',top:((cursorPos.y/resolution)*100)+'%',transform:'translate(-50%,-50%)',display:cursorPos.x<0?'none':'block'}}/>}
+                                    {cloneSource && viewMap==='base' && <div className="absolute w-4 h-4 border-2 border-red-500 rounded-full pointer-events-none -ml-2 -mt-2" style={{left:((cloneSource.x/resolution)*100)+'%', top:((cloneSource.y/resolution)*100)+'%'}}/>}
+                                </div>
+
+                                {showTiling && <canvas ref={ghosts[4]} className="opacity-50"/>}
+                                {showTiling && <><canvas ref={ghosts[5]} className="opacity-50"/><canvas ref={ghosts[6]} className="opacity-50"/><canvas ref={ghosts[7]} className="opacity-50"/></>}
+                            </div>
+                         </div>
+                    </div>
+                    <div className="w-[400px] bg-black border-l border-slate-800 relative">
+                        <div className="absolute top-2 right-2 z-10 flex gap-2">
+                            <select className="bg-black/50 text-xs text-slate-300 border border-slate-700 rounded px-2 py-1" value={envMode} onChange={e=>setEnvMode(e.target.value)}>
+                                <option value="studio">Studio</option><option value="sunset">Sunset</option><option value="overcast">Overcast</option>
+                            </select>
+                        </div>
+                        <div className="absolute bottom-2 left-2 z-10 flex gap-1">
+                            <button onClick={()=>setMeshType('plane')} className={`p-2 rounded bg-black/50 border border-slate-700 hover:bg-slate-700 ${meshType==='plane'?'text-blue-400':'text-slate-300'}`}><Icon name="square" size={16}/></button>
+                            <button onClick={()=>setMeshType('cube')} className={`p-2 rounded bg-black/50 border border-slate-700 hover:bg-slate-700 ${meshType==='cube'?'text-blue-400':'text-slate-300'}`}><Icon name="box" size={16}/></button>
+                            <button onClick={()=>setMeshType('sphere')} className={`p-2 rounded bg-black/50 border border-slate-700 hover:bg-slate-700 ${meshType==='sphere'?'text-blue-400':'text-slate-300'}`}><Icon name="circle" size={16}/></button>
+                        </div>
+                        <div ref={threeMount} className="w-full h-full cursor-move"/>
+                    </div>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
